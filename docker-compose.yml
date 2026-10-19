@@ -1,0 +1,31 @@
+﻿services:
+  product-api:
+    build: ./mock-services/product-api
+    container_name: challenge-product-api
+    ports: ["8001:8000"]
+    environment:
+      PRODUCT_API_KEY: challenge-product-key
+  warehouse-api:
+    build: ./mock-services/warehouse-api
+    container_name: challenge-warehouse-api
+    ports: ["8002:8000"]
+    environment:
+      WAREHOUSE_API_KEY: challenge-warehouse-key
+  localstack:
+    profiles: ["localstack"]
+    image: localstack/localstack:latest
+    container_name: catalogue-localstack
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=s3,dynamodb,stepfunctions,events,ecs,iam,logs,cloudwatch,sns,secretsmanager,sts,ec2
+      - AWS_DEFAULT_REGION=us-east-1
+      - PERSISTENCE=1
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - LOCALSTACK_AUTH_TOKEN
+    volumes:
+      - localstack-data:/var/lib/localstack
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  localstack-data:

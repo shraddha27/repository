@@ -25,3 +25,12 @@ AWS_ENDPOINT_URL = os.getenv("AWS_ENDPOINT_URL")
 RUN_ID = os.getenv("RUN_ID")
 PAGE_SIZE = _bounded_positive_int("PAGE_SIZE", 500, 500)
 BATCH_SIZE = _bounded_positive_int("BATCH_SIZE", 100, 100)
+WMS_WORKERS = _bounded_positive_int("WMS_WORKERS", 4, 32)
+SQS_QUEUE_URL = os.getenv("SQS_QUEUE_URL")
+WORKER_POLL_SECONDS = _bounded_positive_int("WORKER_POLL_SECONDS", 20, 20)
+WORKER_VISIBILITY_TIMEOUT = _bounded_positive_int(
+    "WORKER_VISIBILITY_TIMEOUT", 300, 43200
+)
+RUN_COMPLETION_TIMEOUT_SECONDS = _bounded_positive_int(
+    "RUN_COMPLETION_TIMEOUT_SECONDS", 14400, 86400
+)

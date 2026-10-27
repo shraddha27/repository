@@ -20,19 +20,21 @@ provider "aws" {
   dynamic "endpoints" {
     for_each = var.localstack_endpoint == null ? [] : [var.localstack_endpoint]
     content {
-      cloudwatch     = endpoints.value
-      dynamodb       = endpoints.value
-      ec2            = endpoints.value
-      ecr            = endpoints.value
-      ecs            = endpoints.value
-      events         = endpoints.value
-      iam            = endpoints.value
-      logs           = endpoints.value
-      s3             = endpoints.value
-      secretsmanager = endpoints.value
-      sfn            = endpoints.value
-      sns            = endpoints.value
-      sts            = endpoints.value
+      applicationautoscaling = endpoints.value
+      cloudwatch             = endpoints.value
+      dynamodb               = endpoints.value
+      ec2                    = endpoints.value
+      ecr                    = endpoints.value
+      ecs                    = endpoints.value
+      events                 = endpoints.value
+      iam                    = endpoints.value
+      logs                   = endpoints.value
+      s3                     = endpoints.value
+      secretsmanager         = endpoints.value
+      sqs                    = endpoints.value
+      sfn                    = endpoints.value
+      sns                    = endpoints.value
+      sts                    = endpoints.value
     }
   }
 }
@@ -45,6 +47,7 @@ locals {
   warehouse_api_secret_arn = local.is_localstack ? aws_secretsmanager_secret.local_warehouse_api_key[0].arn : var.warehouse_api_key_secret_arn
   task_subnet_ids          = local.is_localstack ? [aws_subnet.localstack[0].id] : var.subnet_ids
   task_security_group_ids  = local.is_localstack ? [aws_security_group.localstack[0].id] : var.security_group_ids
+  task_queue_url           = local.is_localstack ? "${trimsuffix(var.task_aws_endpoint_url, "/")}/${data.aws_caller_identity.current.account_id}/${aws_sqs_queue.batches.name}" : aws_sqs_queue.batches.url
 }
 
 resource "aws_vpc" "localstack" {
@@ -156,8 +159,34 @@ resource "aws_dynamodb_table" "runs" {
   }
 }
 
+resource "aws_sqs_queue" "dead_letter" {
+  name                        = "${var.name_prefix}-wms-batches-dlq.fifo"
+  fifo_queue                  = true
+  content_based_deduplication = false
+  message_retention_seconds   = 1209600
+}
+
+resource "aws_sqs_queue" "batches" {
+  name                        = "${var.name_prefix}-wms-batches.fifo"
+  fifo_queue                  = true
+  content_based_deduplication = false
+  deduplication_scope         = "messageGroup"
+  fifo_throughput_limit       = "perMessageGroupId"
+  visibility_timeout_seconds  = 300
+  message_retention_seconds   = 345600
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.dead_letter.arn
+    maxReceiveCount     = 5
+  })
+}
+
 resource "aws_cloudwatch_log_group" "task" {
   name              = "/ecs/${var.name_prefix}-catalogue-sync"
+  retention_in_days = 90
+}
+
+resource "aws_cloudwatch_log_group" "worker" {
+  name              = "/ecs/${var.name_prefix}-catalogue-worker"
   retention_in_days = 90
 }
 
@@ -239,6 +268,31 @@ resource "aws_iam_role_policy" "task_access" {
           "dynamodb:UpdateItem"
         ]
         Resource = aws_dynamodb_table.runs.arn
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "sqs:ChangeMessageVisibility",
+          "sqs:DeleteMessage",
+          "sqs:GetQueueAttributes",
+          "sqs:GetQueueUrl",
+          "sqs:ReceiveMessage",
+          "sqs:SendMessage"
+        ]
+        Resource = [
+          aws_sqs_queue.batches.arn,
+          aws_sqs_queue.dead_letter.arn
+        ]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["ecs:UpdateTaskProtection"]
+        Resource = "*"
+        Condition = {
+          ArnEquals = {
+            "ecs:cluster" = aws_ecs_cluster.catalogue.arn
+          }
+        }
       }
     ]
   })
@@ -246,6 +300,11 @@ resource "aws_iam_role_policy" "task_access" {
 
 resource "aws_ecs_cluster" "catalogue" {
   name = "${var.name_prefix}-catalogue"
+
+  setting {
+    name  = "containerInsights"
+    value = "enabled"
+  }
 }
 
 resource "aws_ecs_task_definition" "catalogue" {
@@ -277,7 +336,9 @@ resource "aws_ecs_task_definition" "catalogue" {
       { name = "PRODUCT_API_URL", value = var.product_api_url },
       { name = "WAREHOUSE_API_URL", value = var.warehouse_api_url },
       { name = "PAGE_SIZE", value = "500" },
-      { name = "BATCH_SIZE", value = "100" }
+      { name = "BATCH_SIZE", value = "100" },
+      { name = "SQS_QUEUE_URL", value = local.task_queue_url },
+      { name = "RUN_COMPLETION_TIMEOUT_SECONDS", value = "14400" }
       ], local.is_localstack ? [
       { name = "AWS_ENDPOINT_URL", value = var.task_aws_endpoint_url },
       { name = "AWS_ACCESS_KEY_ID", value = "test" },
@@ -297,6 +358,316 @@ resource "aws_ecs_task_definition" "catalogue" {
       }
     }
   }])
+}
+
+resource "aws_ecs_task_definition" "worker" {
+  family                   = "${var.name_prefix}-catalogue-worker"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "512"
+  memory                   = "1024"
+  execution_role_arn       = aws_iam_role.task_execution.arn
+  task_role_arn            = aws_iam_role.task.arn
+
+  container_definitions = jsonencode([{
+    name      = "catalogue-worker"
+    image     = var.container_image
+    essential = true
+    command   = ["python", "-m", "app.worker"]
+    environment = concat([
+      { name = "DYNAMODB_TABLE", value = aws_dynamodb_table.runs.name },
+      { name = "SQS_QUEUE_URL", value = local.task_queue_url },
+      { name = "WAREHOUSE_API_URL", value = var.warehouse_api_url },
+      { name = "BATCH_SIZE", value = "100" },
+      { name = "WORKER_POLL_SECONDS", value = "20" },
+      { name = "WORKER_VISIBILITY_TIMEOUT", value = "300" },
+      { name = "ECS_CLUSTER_NAME", value = aws_ecs_cluster.catalogue.name }
+      ], local.is_localstack ? [
+      { name = "AWS_ENDPOINT_URL", value = var.task_aws_endpoint_url },
+      { name = "AWS_ACCESS_KEY_ID", value = "test" },
+      { name = "AWS_SECRET_ACCESS_KEY", value = "test" },
+      { name = "AWS_DEFAULT_REGION", value = var.aws_region }
+    ] : [])
+    secrets = [
+      { name = "WAREHOUSE_API_KEY", valueFrom = local.warehouse_api_secret_arn }
+    ]
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        awslogs-group         = aws_cloudwatch_log_group.worker.name
+        awslogs-region        = var.aws_region
+        awslogs-stream-prefix = "worker"
+      }
+    }
+  }])
+}
+
+resource "aws_ecs_service" "workers" {
+  name            = "${var.name_prefix}-catalogue-workers"
+  cluster         = aws_ecs_cluster.catalogue.id
+  task_definition = aws_ecs_task_definition.worker.arn
+  desired_count   = var.worker_desired_count
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = local.task_subnet_ids
+    security_groups  = local.task_security_group_ids
+    assign_public_ip = false
+  }
+
+  deployment_minimum_healthy_percent = 0
+  deployment_maximum_percent         = 200
+
+  lifecycle {
+    ignore_changes = [desired_count]
+  }
+}
+
+resource "aws_appautoscaling_target" "workers" {
+  min_capacity       = var.worker_desired_count
+  max_capacity       = var.worker_max_capacity
+  resource_id        = "service/${aws_ecs_cluster.catalogue.name}/${aws_ecs_service.workers.name}"
+  scalable_dimension = "ecs:service:DesiredCount"
+  service_namespace  = "ecs"
+
+  depends_on = [aws_ecs_service.workers]
+
+  lifecycle {
+    precondition {
+      condition     = var.worker_desired_count <= var.worker_max_capacity
+      error_message = "worker_max_capacity must be at least worker_desired_count."
+    }
+  }
+}
+
+resource "aws_appautoscaling_policy" "workers_queue_backlog" {
+  name               = "${var.name_prefix}-workers-queue-backlog"
+  policy_type        = "TargetTrackingScaling"
+  resource_id        = aws_appautoscaling_target.workers.resource_id
+  scalable_dimension = aws_appautoscaling_target.workers.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.workers.service_namespace
+
+  target_tracking_scaling_policy_configuration {
+    target_value       = var.worker_target_backlog_per_task
+    scale_out_cooldown = 60
+    scale_in_cooldown  = 300
+
+    customized_metric_specification {
+      metrics {
+        label = "Visible SQS worker batches"
+        id    = "m1"
+
+        metric_stat {
+          metric {
+            metric_name = "ApproximateNumberOfMessagesVisible"
+            namespace   = "AWS/SQS"
+
+            dimensions {
+              name  = "QueueName"
+              value = aws_sqs_queue.batches.name
+            }
+          }
+
+          stat = "Sum"
+        }
+
+        return_data = false
+      }
+
+      metrics {
+        label = "Running ECS worker tasks"
+        id    = "m2"
+
+        metric_stat {
+          metric {
+            metric_name = "RunningTaskCount"
+            namespace   = "ECS/ContainerInsights"
+
+            dimensions {
+              name  = "ClusterName"
+              value = aws_ecs_cluster.catalogue.name
+            }
+
+            dimensions {
+              name  = "ServiceName"
+              value = aws_ecs_service.workers.name
+            }
+          }
+
+          stat = "Average"
+        }
+
+        return_data = false
+      }
+
+      metrics {
+        label       = "Visible batches per running worker"
+        id          = "e1"
+        expression  = "m1 / m2"
+        return_data = true
+      }
+    }
+  }
+}
+
+resource "aws_cloudwatch_dashboard" "workers" {
+  dashboard_name = "${var.name_prefix}-worker-throughput"
+  dashboard_body = jsonencode({
+    widgets = [
+      {
+        type   = "metric"
+        x      = 0
+        y      = 0
+        width  = 12
+        height = 6
+        properties = {
+          title  = "WMS request rate and errors"
+          view   = "timeSeries"
+          region = var.aws_region
+          period = 60
+          metrics = [
+            [{ expression = "m1/60", label = "Requests/second", id = "e1" }],
+            [{ expression = "m2/60", label = "Errors/second", id = "e2" }],
+            [
+              "ProductCatalogue/Workers",
+              "WmsRequestAttempts",
+              "ServiceName",
+              "catalogue-worker",
+              "Operation",
+              "Batch",
+              { stat = "Sum", period = 60, id = "m1", visible = false }
+            ],
+            [
+              "ProductCatalogue/Workers",
+              "WmsRequestErrors",
+              "ServiceName",
+              "catalogue-worker",
+              "Operation",
+              "Batch",
+              { stat = "Sum", period = 60, id = "m2", visible = false }
+            ]
+          ]
+          yAxis = {
+            left = { min = 0 }
+          }
+        }
+      },
+      {
+        type   = "metric"
+        x      = 12
+        y      = 0
+        width  = 12
+        height = 6
+        properties = {
+          title  = "WMS request latency"
+          view   = "timeSeries"
+          region = var.aws_region
+          period = 60
+          metrics = [
+            [
+              "ProductCatalogue/Workers",
+              "WmsRequestLatencyMs",
+              "ServiceName",
+              "catalogue-worker",
+              "Operation",
+              "Batch",
+              { stat = "Average", period = 60, id = "m1" }
+            ],
+            [
+              "ProductCatalogue/Workers",
+              "WmsRequestLatencyMs",
+              "ServiceName",
+              "catalogue-worker",
+              "Operation",
+              "Batch",
+              { stat = "p95", period = 60, id = "m2" }
+            ]
+          ]
+          yAxis = {
+            left = { min = 0, label = "Milliseconds" }
+          }
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 6
+        width  = 12
+        height = 6
+        properties = {
+          title  = "WMS SQS queue backlog"
+          view   = "timeSeries"
+          region = var.aws_region
+          period = 60
+          metrics = [
+            [
+              "AWS/SQS",
+              "ApproximateNumberOfMessagesVisible",
+              "QueueName",
+              aws_sqs_queue.batches.name,
+              { stat = "Maximum", id = "m1" }
+            ],
+            [
+              "AWS/SQS",
+              "ApproximateNumberOfMessagesNotVisible",
+              "QueueName",
+              aws_sqs_queue.batches.name,
+              { stat = "Maximum", id = "m2" }
+            ],
+            [
+              "AWS/SQS",
+              "ApproximateAgeOfOldestMessage",
+              "QueueName",
+              aws_sqs_queue.batches.name,
+              { stat = "Maximum", id = "m3", yAxis = "right" }
+            ]
+          ]
+          yAxis = {
+            left  = { min = 0, label = "Messages" }
+            right = { min = 0, label = "Seconds" }
+          }
+        }
+      },
+      {
+        type   = "metric"
+        x      = 12
+        y      = 6
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Running workers and visible batches per worker"
+          view   = "timeSeries"
+          region = var.aws_region
+          period = 60
+          metrics = [
+            [
+              "ECS/ContainerInsights",
+              "RunningTaskCount",
+              "ClusterName",
+              aws_ecs_cluster.catalogue.name,
+              "ServiceName",
+              aws_ecs_service.workers.name,
+              { stat = "Average", id = "m1", yAxis = "left" }
+            ],
+            [
+              "AWS/SQS",
+              "ApproximateNumberOfMessagesVisible",
+              "QueueName",
+              aws_sqs_queue.batches.name,
+              { stat = "Sum", id = "m2", visible = false }
+            ],
+            [
+              { expression = "m2/m1", label = "Visible batches per running worker", id = "e1", yAxis = "right" }
+            ]
+          ]
+          yAxis = {
+            left  = { min = 0, label = "Running tasks" }
+            right = { min = 0, label = "Batches per worker" }
+          }
+        }
+      }
+    ]
+  })
 }
 
 resource "aws_sfn_state_machine" "catalogue" {
@@ -475,19 +846,36 @@ resource "aws_cloudwatch_metric_alarm" "workflow_timed_out" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "workflow_slow" {
-  alarm_name          = "${var.name_prefix}-catalogue-execution-over-30m"
-  alarm_description   = "A completed catalogue workflow exceeded the 30-minute target."
+  alarm_name          = "${var.name_prefix}-catalogue-execution-over-4h"
+  alarm_description   = "A completed catalogue workflow exceeded the four-hour target."
   namespace           = "AWS/States"
   metric_name         = "ExecutionTime"
   statistic           = "Maximum"
   unit                = "Milliseconds"
   period              = 300
   evaluation_periods  = 1
-  threshold           = 1800000
+  threshold           = 14400000
   comparison_operator = "GreaterThanOrEqualToThreshold"
   treat_missing_data  = "notBreaching"
   dimensions = {
     StateMachineArn = aws_sfn_state_machine.catalogue.arn
+  }
+  alarm_actions = [aws_sns_topic.alarms.arn]
+}
+
+resource "aws_cloudwatch_metric_alarm" "worker_dead_letter" {
+  alarm_name          = "${var.name_prefix}-catalogue-worker-dead-letter"
+  alarm_description   = "One or more catalogue batches exceeded SQS worker retries."
+  namespace           = "AWS/SQS"
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  statistic           = "Maximum"
+  period              = 60
+  evaluation_periods  = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  dimensions = {
+    QueueName = aws_sqs_queue.dead_letter.name
   }
   alarm_actions = [aws_sns_topic.alarms.arn]
 }

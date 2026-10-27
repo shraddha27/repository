@@ -1,16 +1,26 @@
+import json
 import logging
+import sys
 import time
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from threading import Lock
-from typing import Any
+from typing import Any, Callable, Protocol
 
 import httpx
+from botocore.exceptions import ClientError
+
+from app.aws import client as aws_client
 
 TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
 MAX_RETRIES = 5
 logger = logging.getLogger(__name__)
+RequestObserver = Callable[[float, int | None], None]
+
+
+class RequestRateLimiter(Protocol):
+    def wait(self) -> None: ...
 
 
 class RateLimiter:
@@ -30,6 +40,43 @@ class RateLimiter:
             self._next_request = max(now, self._next_request) + self._interval
 
 
+class DynamoDBRateLimiter:
+    def __init__(self, table_name: str, requests_per_second: int) -> None:
+        if requests_per_second <= 0:
+            raise ValueError("requests_per_second must be positive")
+        self.client = aws_client("dynamodb")
+        self.table_name = table_name
+        self._interval_ms = max(1, round(1000 / requests_per_second))
+
+    def wait(self) -> None:
+        while True:
+            now_ms = time.time_ns() // 1_000_000
+            try:
+                self.client.update_item(
+                    TableName=self.table_name,
+                    Key={
+                        "pk": {"S": "RATE#WMS"},
+                        "sk": {"S": "GLOBAL"},
+                    },
+                    UpdateExpression="SET next_allowed_at = :next",
+                    ConditionExpression=(
+                        "attribute_not_exists(next_allowed_at) OR "
+                        "next_allowed_at <= :now"
+                    ),
+                    ExpressionAttributeValues={
+                        ":now": {"N": str(now_ms)},
+                        ":next": {"N": str(now_ms + self._interval_ms)},
+                    },
+                )
+                return
+            except ClientError as error:
+                if error.response.get("Error", {}).get("Code") != (
+                    "ConditionalCheckFailedException"
+                ):
+                    raise
+                time.sleep(self._interval_ms / 1000)
+
+
 def _retry_delay(headers: Mapping[str, str], retry_number: int) -> float:
     retry_after = headers.get("Retry-After")
     if retry_after is not None:
@@ -46,14 +93,41 @@ def _retry_delay(headers: Mapping[str, str], retry_number: int) -> float:
     return min(2 ** (retry_number - 1), 30)
 
 
+def emit_wms_attempt_metric(latency_seconds: float, status_code: int | None) -> None:
+    timestamp_ms = time.time_ns() // 1_000_000
+    event = {
+        "_aws": {
+            "Timestamp": timestamp_ms,
+            "CloudWatchMetrics": [
+                {
+                    "Namespace": "ProductCatalogue/Workers",
+                    "Dimensions": [["ServiceName", "Operation"]],
+                    "Metrics": [
+                        {"Name": "WmsRequestAttempts", "Unit": "Count"},
+                        {"Name": "WmsRequestErrors", "Unit": "Count"},
+                        {"Name": "WmsRequestLatencyMs", "Unit": "Milliseconds"},
+                    ],
+                }
+            ],
+        },
+        "ServiceName": "catalogue-worker",
+        "Operation": "Batch",
+        "WmsRequestAttempts": 1,
+        "WmsRequestErrors": int(status_code is None or status_code >= 400),
+        "WmsRequestLatencyMs": latency_seconds * 1000,
+    }
+    print(json.dumps(event, separators=(",", ":")), file=sys.stdout, flush=True)
+
+
 def request_with_retries(
     method: str,
     url: str,
     *,
     client: httpx.Client | None = None,
-    rate_limiter: RateLimiter | None = None,
+    rate_limiter: RequestRateLimiter | None = None,
     retry_statuses: set[int] | None = None,
     retry_transport_errors: bool = True,
+    request_observer: RequestObserver | None = None,
     **kwargs: Any,
 ) -> httpx.Response:
     statuses_to_retry = TRANSIENT_STATUSES if retry_statuses is None else retry_statuses
@@ -61,10 +135,20 @@ def request_with_retries(
         try:
             if rate_limiter is not None:
                 rate_limiter.wait()
-            if client is None:
-                response = httpx.request(method, url, **kwargs)
-            else:
-                response = client.request(method, url, **kwargs)
+            request_started = time.perf_counter()
+            try:
+                if client is None:
+                    response = httpx.request(method, url, **kwargs)
+                else:
+                    response = client.request(method, url, **kwargs)
+            except httpx.TransportError:
+                if request_observer is not None:
+                    request_observer(time.perf_counter() - request_started, None)
+                raise
+            if request_observer is not None:
+                request_observer(
+                    time.perf_counter() - request_started, response.status_code
+                )
         except httpx.TransportError:
             if not retry_transport_errors or retry_number > MAX_RETRIES:
                 raise

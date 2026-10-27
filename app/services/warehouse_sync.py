@@ -1,13 +1,18 @@
 import csv
 import logging
+import sqlite3
+import tempfile
 import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from collections.abc import Generator
+from pathlib import Path
 from typing import Any
 
 import httpx
 
 from app.clients.warehouse_api import send_batch
-from app.config import BATCH_SIZE
-from app.storage.checkpoint import CheckpointStore
+from app.config import BATCH_SIZE, WMS_WORKERS
+from app.storage.checkpoint import CheckpointBackend
 
 logger = logging.getLogger(__name__)
 
@@ -53,99 +58,159 @@ def _validate_result(
     return accepted, normalized_rejections
 
 
-def sync_catalogue(path: str, run_id: str, checkpoints: CheckpointStore) -> None:
-    completed = checkpoints.completed_skus(run_id)
-    batch: list[dict[str, Any]] = []
-    batch_skus: set[str] = set()
-    batch_number = checkpoints.next_batch_number(run_id)
+def process_batch(
+    products: list[dict[str, Any]],
+    run_id: str,
+    number: int,
+    checkpoints: CheckpointBackend,
+    client: httpx.Client,
+) -> None:
+    checkpoints.begin_batch(run_id, number, products)
+    started_at = time.monotonic()
+    try:
+        response = send_batch(products, client)
+    except httpx.TransportError as error:
+        checkpoints.mark_batch(run_id, number, "AMBIGUOUS", str(error))
+        logger.error(
+            "WMS batch outcome ambiguous run_id=%s batch=%s reason=transport_error",
+            run_id,
+            number,
+        )
+        raise RuntimeError(
+            f"WMS outcome is ambiguous for run {run_id}, batch {number}; reconcile before retrying"
+        ) from error
+    except httpx.HTTPStatusError as error:
+        status = error.response.status_code
+        state = "AMBIGUOUS" if status >= 500 else "FAILED"
+        checkpoints.mark_batch(run_id, number, state, str(error))
+        logger.error(
+            "WMS batch failed run_id=%s batch=%s status=%s outcome=%s",
+            run_id,
+            number,
+            status,
+            state,
+        )
+        if state == "AMBIGUOUS":
+            raise RuntimeError(
+                f"WMS outcome is ambiguous for run {run_id}, batch {number}; reconcile before retrying"
+            ) from error
+        raise
+    except ValueError as error:
+        checkpoints.mark_batch(run_id, number, "AMBIGUOUS", str(error))
+        logger.error(
+            "WMS batch outcome ambiguous run_id=%s batch=%s reason=invalid_response",
+            run_id,
+            number,
+        )
+        raise RuntimeError(
+            f"WMS returned an unreadable result for run {run_id}, batch {number}"
+        ) from error
+
+    try:
+        accepted, rejected = _validate_result(response, products)
+    except ValueError as error:
+        checkpoints.mark_batch(run_id, number, "AMBIGUOUS", str(error))
+        logger.error(
+            "WMS batch outcome ambiguous run_id=%s batch=%s reason=unaccountable_response",
+            run_id,
+            number,
+        )
+        raise RuntimeError(
+            f"WMS returned an unaccountable result for run {run_id}, batch {number}"
+        ) from error
+
+    checkpoints.complete_batch(run_id, number, accepted, rejected)
+    logger.info(
+        "WMS batch completed run_id=%s batch=%s products=%s accepted=%s rejected=%s duration_seconds=%.3f",
+        run_id,
+        number,
+        len(products),
+        len(accepted),
+        len(rejected),
+        time.monotonic() - started_at,
+    )
+
+
+def sync_catalogue(path: str, run_id: str, checkpoints: CheckpointBackend) -> None:
+    completed_batches = checkpoints.completed_batches(run_id)
 
     def submit_batch(
         products: list[dict[str, Any]], number: int, client: httpx.Client
     ) -> None:
-        checkpoints.begin_batch(run_id, number, products)
-        started_at = time.monotonic()
-        try:
-            response = send_batch(products, client)
-        except httpx.TransportError as error:
-            checkpoints.mark_batch(run_id, number, "AMBIGUOUS", str(error))
-            logger.error(
-                "WMS batch outcome ambiguous run_id=%s batch=%s reason=transport_error",
-                run_id,
-                number,
-            )
-            raise RuntimeError(
-                f"WMS outcome is ambiguous for run {run_id}, batch {number}; reconcile before retrying"
-            ) from error
-        except httpx.HTTPStatusError as error:
-            status = error.response.status_code
-            state = "AMBIGUOUS" if status >= 500 else "FAILED"
-            checkpoints.mark_batch(run_id, number, state, str(error))
-            logger.error(
-                "WMS batch failed run_id=%s batch=%s status=%s outcome=%s",
-                run_id,
-                number,
-                status,
-                state,
-            )
-            if state == "AMBIGUOUS":
-                raise RuntimeError(
-                    f"WMS outcome is ambiguous for run {run_id}, batch {number}; reconcile before retrying"
-                ) from error
-            raise
-        except ValueError as error:
-            checkpoints.mark_batch(run_id, number, "AMBIGUOUS", str(error))
-            logger.error(
-                "WMS batch outcome ambiguous run_id=%s batch=%s reason=invalid_response",
-                run_id,
-                number,
-            )
-            raise RuntimeError(
-                f"WMS returned an unreadable result for run {run_id}, batch {number}"
-            ) from error
+        process_batch(products, run_id, number, checkpoints, client)
 
-        try:
-            accepted, rejected = _validate_result(response, products)
-        except ValueError as error:
-            checkpoints.mark_batch(run_id, number, "AMBIGUOUS", str(error))
-            logger.error(
-                "WMS batch outcome ambiguous run_id=%s batch=%s reason=unaccountable_response",
-                run_id,
-                number,
-            )
-            raise RuntimeError(
-                f"WMS returned an unaccountable result for run {run_id}, batch {number}"
-            ) from error
+    def batches() -> Generator[tuple[int, list[dict[str, Any]]], None, None]:
+        with tempfile.TemporaryDirectory(prefix="catalogue-sku-index-") as directory:
+            index = sqlite3.connect(Path(directory) / "seen.sqlite3")
+            try:
+                index.execute("CREATE TABLE seen_skus (sku TEXT PRIMARY KEY)")
+                batch_number = 1
+                batch: list[dict[str, Any]] = []
+                with open(path, newline="", encoding="utf-8") as source:
+                    for row in csv.DictReader(source):
+                        product = transform(row)
+                        sku = product["sku"]
+                        try:
+                            index.execute(
+                                "INSERT INTO seen_skus (sku) VALUES (?)", (sku,)
+                            )
+                        except sqlite3.IntegrityError as error:
+                            message = f"Duplicate product SKU in catalogue: {sku}"
+                            checkpoints.fail_run(run_id, message)
+                            raise ValueError(message) from error
 
-        checkpoints.complete_batch(run_id, number, accepted, rejected)
-        logger.info(
-            "WMS batch completed run_id=%s batch=%s products=%s accepted=%s rejected=%s duration_seconds=%.3f",
-            run_id,
-            number,
-            len(products),
-            len(accepted),
-            len(rejected),
-            time.monotonic() - started_at,
-        )
-        completed.update(accepted)
-        completed.update(item["sku"] for item in rejected)
+                        batch.append(product)
+                        if len(batch) == BATCH_SIZE:
+                            if batch_number not in completed_batches:
+                                yield batch_number, batch
+                            batch_number += 1
+                            batch = []
 
-    with httpx.Client() as client:
-        with open(path, newline="", encoding="utf-8") as source:
-            for row in csv.DictReader(source):
-                product = transform(row)
-                sku = product["sku"]
-                if sku in completed:
-                    continue
-                if sku in batch_skus:
-                    checkpoints.fail_run(run_id, f"Duplicate product SKU in catalogue: {sku}")
-                    raise ValueError(f"Duplicate product SKU in catalogue: {sku}")
-                batch.append(product)
-                batch_skus.add(sku)
-                if len(batch) == BATCH_SIZE:
-                    submit_batch(batch, batch_number, client)
-                    batch_number += 1
-                    batch = []
-                    batch_skus = set()
+                    if batch and batch_number not in completed_batches:
+                        yield batch_number, batch
+            finally:
+                index.close()
 
-            if batch:
-                submit_batch(batch, batch_number, client)
+    batch_iterator = iter(batches())
+    first_error: Exception | None = None
+    pending: dict[Future[None], int] = {}
+
+    try:
+        with httpx.Client() as client, ThreadPoolExecutor(
+            max_workers=WMS_WORKERS, thread_name_prefix="wms-batch"
+        ) as executor:
+            while len(pending) < WMS_WORKERS:
+                try:
+                    number, products = next(batch_iterator)
+                except StopIteration:
+                    break
+                except Exception as error:
+                    first_error = error
+                    break
+                pending[executor.submit(submit_batch, products, number, client)] = number
+
+            while pending:
+                completed_futures, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in completed_futures:
+                    pending.pop(future)
+                    try:
+                        future.result()
+                    except Exception as error:
+                        if first_error is None:
+                            first_error = error
+
+                if first_error is None:
+                    while len(pending) < WMS_WORKERS:
+                        try:
+                            number, products = next(batch_iterator)
+                        except StopIteration:
+                            break
+                        except Exception as error:
+                            first_error = error
+                            break
+                        pending[executor.submit(submit_batch, products, number, client)] = number
+    finally:
+        batch_iterator.close()
+
+    if first_error is not None:
+        raise first_error

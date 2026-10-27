@@ -5,10 +5,25 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from app.clients.http import RateLimiter, request_with_retries
-from app.config import BATCH_SIZE, WAREHOUSE_API_KEY, WAREHOUSE_API_URL
+from app.clients.http import (
+    DynamoDBRateLimiter,
+    RateLimiter,
+    emit_wms_attempt_metric,
+    request_with_retries,
+)
+from app.config import (
+    BATCH_SIZE,
+    DYNAMODB_TABLE,
+    SQS_QUEUE_URL,
+    WAREHOUSE_API_KEY,
+    WAREHOUSE_API_URL,
+)
 
-_RATE_LIMITER = RateLimiter(20)
+_RATE_LIMITER = (
+    DynamoDBRateLimiter(DYNAMODB_TABLE, 20)
+    if SQS_QUEUE_URL and DYNAMODB_TABLE
+    else RateLimiter(20)
+)
 
 
 def _retry_statuses(url: str) -> set[int]:
@@ -36,6 +51,7 @@ def send_batch(
         rate_limiter=_RATE_LIMITER,
         retry_statuses=_retry_statuses(WAREHOUSE_API_URL),
         retry_transport_errors=False,
+        request_observer=emit_wms_attempt_metric if SQS_QUEUE_URL else None,
         timeout=30,
     )
     response.raise_for_status()

@@ -83,3 +83,44 @@ variable "schedule_expression" {
   description = "EventBridge schedule expression (UTC)."
   default     = "cron(0 2 * * ? *)"
 }
+
+variable "worker_desired_count" {
+  type        = number
+  description = "Minimum number of independent Fargate workers polling the WMS batch queue."
+  default     = 4
+
+  validation {
+    condition = (
+      var.worker_desired_count >= 1 &&
+      var.worker_desired_count <= 32 &&
+      var.worker_desired_count == floor(var.worker_desired_count)
+    )
+    error_message = "worker_desired_count must be an integer between 1 and 32."
+  }
+}
+
+variable "worker_max_capacity" {
+  type        = number
+  description = "Maximum number of independent Fargate worker tasks for queue autoscaling."
+  default     = 32
+
+  validation {
+    condition = (
+      var.worker_max_capacity >= 1 &&
+      var.worker_max_capacity <= 32 &&
+      var.worker_max_capacity == floor(var.worker_max_capacity)
+    )
+    error_message = "worker_max_capacity must be an integer between 1 and 32."
+  }
+}
+
+variable "worker_target_backlog_per_task" {
+  type        = number
+  description = "Target visible SQS batches per running worker task for autoscaling."
+  default     = 10
+
+  validation {
+    condition     = var.worker_target_backlog_per_task > 0
+    error_message = "worker_target_backlog_per_task must be greater than zero."
+  }
+}

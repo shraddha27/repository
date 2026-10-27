@@ -41,11 +41,15 @@ it can be retried.
 ### Using local AWS services with LocalStack
 
 With the `localstack` Compose profile, LocalStack provides the AWS services
-used by the Terraform deployment, including S3, DynamoDB, ECS, Step Functions,
-EventBridge, IAM, Secrets Manager, CloudWatch, CloudWatch Logs, and SNS. ECS
+used by the Terraform deployment, including S3, DynamoDB, ECS, Application Auto
+Scaling, Step Functions, EventBridge, IAM, Secrets Manager, CloudWatch,
+CloudWatch Logs, and SNS. ECS
 uses Docker Desktop's Docker socket to run the task container locally. The
 normal Compose setup for the mock APIs does not need the LocalStack profile.
 The current LocalStack image requires an auth token for this service set.
+LocalStack support for ECS and Application Auto Scaling depends on the installed
+edition and license; local emulation is not a substitute for validating AWS
+scale-out and scale-in behavior.
 Obtain one from your LocalStack account and enter it into the PowerShell
 session without committing it to the repository:
 
@@ -143,14 +147,58 @@ docker build -t product-catalogue-integration:local .
 ```
 
 The catalogue export is written incrementally to a temporary CSV and published
-only after all product pages are retrieved. PIM calls are limited to 10 requests
-per second; WMS calls are limited to 20 requests per second and sent in batches
-of at most 100. Both APIs' 429 responses honor `Retry-After`; the PIM client also
-retries transient 5xx and transport failures. WMS 5xx/transport failures are
-treated as ambiguous and are not retried automatically because the WMS may have
-accepted the batch before the response was lost. For the supplied loopback WMS
-mock only, HTTP 500 is retried because its simulated rate-limit error raises
-before processing the batch.
+only after all product pages are retrieved. The default queued run timeout is
+four hours (`RUN_COMPLETION_TIMEOUT_SECONDS=14400`), configurable up to 24
+hours. In Terraform/AWS mode, the producer
+places batches of at most 100 products on an SQS FIFO queue, publishing up to
+ten batches per SQS API call. A separate ECS
+worker service runs independent tasks (four by default; set
+`worker_desired_count` in Terraform to change the minimum). ECS Application
+Auto Scaling targets a backlog of 10 visible SQS batches per running worker by
+default and can scale up to `worker_max_capacity` (32 by default). Container
+Insights supplies the running-task metric used to calculate backlog per worker.
+The shared DynamoDB limiter still caps WMS attempts at 20 requests per second
+total; autoscaling can help use that allowance when requests are slow, but
+cannot increase it. The service retains its minimum worker count between runs,
+so account for idle Fargate cost. A worker enables ECS task scale-in protection
+while processing a batch and removes it when idle, preventing an ordinary
+scale-in from interrupting an in-flight WMS request. Each worker reuses one
+HTTP connection pool across batches. Worker WMS attempts emit CloudWatch
+Embedded Metric Format events for request latency, attempt count, and errors.
+The `worker_dashboard_name` output identifies a CloudWatch dashboard with
+request rate, latency, SQS visible/in-flight backlog and age, running task
+count, and visible batches per running task. Request rate is displayed as an
+average per second over each one-minute chart period. Use these observations to
+tune the worker minimum, maximum, and backlog target. The coordinator and queue
+workers use synchronous I/O; local WMS batches run in a bounded thread pool.
+The local no-AWS run continues to use a bounded thread pool (`WMS_WORKERS`,
+default four, maximum 32). PIM calls are limited to 10 requests per second.
+Both APIs' 429 responses honor `Retry-After`; the PIM client also retries
+transient 5xx and transport failures. WMS 5xx/transport failures are treated as
+ambiguous and are not retried automatically because the WMS may have accepted
+the batch before the response was lost. For the supplied loopback WMS mock
+only, HTTP 500 is retried because its simulated rate-limit error raises before
+processing the batch.
+
+At the configured limits, 10 million products require at least 20,000 PIM page
+requests (about 33 minutes 20 seconds) and 100,000 WMS batch requests (about 1
+hour 23 minutes 20 seconds). Because export precedes dispatch, the ideal
+minimum is about 1 hour 57 minutes before API latency, retries, queueing,
+checkpointing, and autoscaling delays. The four-hour timeout gives the run
+time to complete but does not guarantee that it will; validate with a
+representative 10-million-product AWS run. The existing 30-minute target is
+not achievable at these API limits.
+
+SQS delivers batches to independent workers and may redeliver messages. DynamoDB
+claims each batch before the WMS call and stores accepted/rejected SKU outcomes
+with its batch record. Completed batches are acknowledged and skipped on
+resume; definitive failed batches can be retried with the same batch number and
+payload. In-flight batches redelivered after a worker failure become ambiguous
+and block automatic replay. A dead-letter queue and CloudWatch alarm surface
+messages that exhaust queue delivery attempts. The independent workers and shared rate limiter do not guarantee a completion
+deadline: benchmark the deployed queue/worker path against representative
+10-million-product API latency, throttling, checkpoint load, and failure
+behavior.
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for the architecture and trade-offs and
 [UNFINISHED.md](./UNFINISHED.md) for known gaps, validation needs, and risks.

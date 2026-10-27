@@ -17,3 +17,18 @@ output "alarm_topic_arn" {
   value       = aws_sns_topic.alarms.arn
   description = "Subscribe operators to this SNS topic to receive workflow alarms."
 }
+
+output "wms_batch_queue_url" {
+  value       = aws_sqs_queue.batches.url
+  description = "FIFO queue distributing WMS batches to independent ECS workers."
+}
+
+output "worker_service_name" {
+  value       = aws_ecs_service.workers.name
+  description = "ECS service running the independent WMS batch workers."
+}
+
+output "worker_dashboard_name" {
+  value       = aws_cloudwatch_dashboard.workers.dashboard_name
+  description = "CloudWatch dashboard for WMS throughput, latency, SQS backlog, and worker count."
+}

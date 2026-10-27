@@ -18,7 +18,7 @@
     ports:
       - "4566:4566"
     environment:
-      - SERVICES=s3,dynamodb,stepfunctions,events,ecs,iam,logs,cloudwatch,sns,secretsmanager,sts,ec2
+      - SERVICES=s3,sqs,dynamodb,stepfunctions,events,ecs,iam,logs,cloudwatch,sns,secretsmanager,sts,ec2,application-autoscaling
       - AWS_DEFAULT_REGION=us-east-1
       - PERSISTENCE=1
       - DOCKER_HOST=unix:///var/run/docker.sock
